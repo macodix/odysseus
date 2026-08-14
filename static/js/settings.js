@@ -548,7 +548,7 @@ async function initDefaultChat() {
   async function saveDefault() {
     try {
       var clean = _fallbacks.filter(function(f) { return f.endpoint_id && f.model; });
-      await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin',
+      var res = await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           default_endpoint_id: epSel.value,
@@ -556,6 +556,7 @@ async function initDefaultChat() {
           default_model_fallbacks: clean
         })
       });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
       msg.textContent = 'Saved'; msg.style.color = 'var(--fg)';
       setTimeout(function() { msg.textContent = ''; }, 2000);
     } catch (e) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; }
