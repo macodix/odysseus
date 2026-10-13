@@ -210,6 +210,7 @@ def test_user_management_fails_closed_when_auth_disabled(client, monkeypatch):
     assert c.put("/api/auth/users/target/privileges", json={"can_chat": False}).status_code == 403
     assert c.put("/api/auth/users/target/rename", json={"username": "newtarget"}).status_code == 403
     assert c.put("/api/auth/users/target/admin", json={"is_admin": True}).status_code == 403
+    assert c.put("/api/auth/users/target/password", json={"new_password": "password123"}).status_code == 403
     assert c.put("/api/auth/open-signup", json={"enabled": True}).status_code == 403
     assert c.request("DELETE", "/api/auth/users", json={"username": "target"}).status_code == 403
 
@@ -301,11 +302,30 @@ def test_user_management_requires_admin_when_auth_enabled(client, monkeypatch):
     # Unauthenticated
     assert c.get("/api/auth/users").status_code == 403
     assert c.post("/api/auth/users", json={"username": "a", "password": "b"}).status_code == 403
+    assert c.put("/api/auth/users/target/password", json={"new_password": "password123"}).status_code == 403
 
     # Non-admin
     c.cookies.set("odysseus_session", "user-token")
     assert c.get("/api/auth/users").status_code == 403
+    assert c.put("/api/auth/users/target/password", json={"new_password": "password123"}).status_code == 403
 
     # Admin
     c.cookies.set("odysseus_session", "session-token")
     assert c.get("/api/auth/users").status_code == 200
+
+
+def test_document_style_extract_gating(client, monkeypatch):
+    c, _ = client
+    dummy_file = {"file": ("sample.txt", b"dummy prose content")}
+
+    # When auth enabled: unauthenticated is 403, non-admin is 403
+    monkeypatch.setenv("AUTH_ENABLED", "true")
+    assert c.post("/api/auth/settings/document-style/extract", files=dummy_file).status_code == 403
+
+    c.cookies.set("odysseus_session", "user-token")
+    assert c.post("/api/auth/settings/document-style/extract", files=dummy_file).status_code == 403
+
+    # When auth disabled: unauthenticated passes admin gate (400 for sample length < 80)
+    monkeypatch.setenv("AUTH_ENABLED", "false")
+    c.cookies.clear()
+    assert c.post("/api/auth/settings/document-style/extract", files=dummy_file).status_code == 400

@@ -4,6 +4,8 @@ import os
 import sys
 import asyncio
 import time
+import shutil
+import socket
 
 # On Windows, asyncio.create_subprocess_exec/shell require the ProactorEventLoop.
 # When started via `python -m uvicorn` from a terminal, uvicorn sets this
@@ -67,7 +69,13 @@ from core.constants import (
     REQUEST_TIMEOUT, OPENAI_API_KEY, AUTH_FILE,
 )
 from core.database import SessionLocal, ApiToken
-from core.middleware import SecurityHeadersMiddleware, is_cors_preflight
+from core.middleware import (
+    SecurityHeadersMiddleware,
+    get_application_route_path,
+    is_cors_preflight,
+    path_is_route_or_child,
+    with_asgi_root_path,
+)
 from core.auth import AuthManager, normalize_known_username
 from core.exceptions import (
     SessionNotFoundError, InvalidFileUploadError,
@@ -78,6 +86,7 @@ import bcrypt as _bcrypt
 
 from src.app_helpers import abs_join, serve_html_with_nonce
 from src.generated_images import GENERATED_IMAGE_HEADERS, resolve_generated_image_path
+from src.owner_identity import auth_disabled
 from starlette.responses import RedirectResponse
 
 # ========= LOGGING =========
@@ -153,7 +162,8 @@ app.add_middleware(
 # model-probe — all served with media_type="text/event-stream") are never
 # compressed or buffered; only complete bodies over minimum_size are. The
 # security-header middleware composes cleanly on top.
-app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
+if os.getenv("RESPONSE_COMPRESSION_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}:
+    app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
 
 # ========= SECURITY HEADERS MIDDLEWARE =========
 app.add_middleware(SecurityHeadersMiddleware)
@@ -248,7 +258,7 @@ from routes.auth_routes import setup_auth_routes, SESSION_COOKIE
 
 auth_manager = AuthManager()
 app.state.auth_manager = auth_manager
-AUTH_ENABLED = os.getenv("AUTH_ENABLED", "true").lower() != "false"
+AUTH_ENABLED = not auth_disabled()
 LOCALHOST_BYPASS = os.getenv("LOCALHOST_BYPASS", "false").lower() == "true"
 if LOCALHOST_BYPASS:
     logger.warning("LOCALHOST_BYPASS is enabled, loopback requests bypass authentication. Do not expose this instance to a network.")
@@ -284,7 +294,7 @@ if AUTH_ENABLED:
     def _is_auth_exempt(path: str) -> bool:
         if path in AUTH_EXEMPT_EXACT:
             return True
-        if any(path.startswith(p) for p in AUTH_EXEMPT_PREFIXES):
+        if any(path_is_route_or_child(path, p) for p in AUTH_EXEMPT_PREFIXES):
             return True
         return any(p.match(path) for p in AUTH_EXEMPT_PATTERNS)
 
@@ -306,6 +316,7 @@ if AUTH_ENABLED:
 
     def _refresh_token_cache():
         """Rebuild the prefix→[(id,hash)] map from the DB."""
+        global _token_cache
         from collections import defaultdict
         new_map = defaultdict(list)
         db = SessionLocal()
@@ -324,8 +335,8 @@ if AUTH_ENABLED:
                 new_map[r.token_prefix].append((r.id, r.token_hash, owner_key, scopes))
         finally:
             db.close()
-        _token_cache.clear()
-        _token_cache.update(new_map)
+        _token_cache = dict(new_map)
+        app.state._token_cache = _token_cache
         app.state._token_cache_dirty = False
 
     # Headers that prove a request was forwarded by a proxy/tunnel (cloudflared,
@@ -355,7 +366,7 @@ if AUTH_ENABLED:
 
     class AuthMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request: Request, call_next):
-            path = request.url.path
+            path = get_application_route_path(request.scope)
             # A genuine CORS preflight (OPTIONS + Access-Control-Request-Method)
             # carries no credentials by design and must reach CORSMiddleware to be
             # answered. AuthMiddleware is the outermost middleware, so gating the
@@ -399,7 +410,10 @@ if AUTH_ENABLED:
             if not auth_manager.is_configured:
                 # No users yet — redirect to login for first-time setup
                 if not path.startswith("/api/"):
-                    return RedirectResponse(url="/login", status_code=302)
+                    return RedirectResponse(
+                        url=with_asgi_root_path(request.scope, "/login"),
+                        status_code=302,
+                    )
                 return JSONResponse(status_code=401, content={"error": "Setup required"})
 
             # --- Bearer token auth (API tokens for external integrations) ---
@@ -461,7 +475,10 @@ if AUTH_ENABLED:
             if not auth_manager.validate_token(token):
                 if path.startswith("/api/"):
                     return JSONResponse(status_code=401, content={"error": "Not authenticated"})
-                return RedirectResponse(url="/login", status_code=302)
+                return RedirectResponse(
+                    url=with_asgi_root_path(request.scope, "/login"),
+                    status_code=302,
+                )
 
             # Attach current username to request state for downstream routes
             request.state.current_user = auth_manager.get_username_for_token(token)
@@ -630,13 +647,24 @@ app.include_router(auth_router)
 
 @app.post("/api/activity/heartbeat")
 async def activity_heartbeat():
-    from src.interactive_gate import mark_browser_activity
+    from src.interactive_gate import (
+        mark_browser_activity,
+        maybe_stop_background_tasks_for_heartbeat,
+    )
+
     await mark_browser_activity()
+
     async def _stop_background():
         try:
-            await task_scheduler.stop_background_tasks_for_foreground(reason="browser heartbeat")
+            await maybe_stop_background_tasks_for_heartbeat(
+                task_scheduler.stop_background_tasks_for_foreground
+            )
         except Exception:
-            logging.getLogger("app.foreground_gate").debug("heartbeat task stop failed", exc_info=True)
+            logging.getLogger("app.foreground_gate").debug(
+                "heartbeat task stop failed",
+                exc_info=True,
+            )
+
     asyncio.create_task(_stop_background())
     return {"ok": True}
 
@@ -660,6 +688,7 @@ app.include_router(setup_session_routes(
     session_config,
     webhook_manager=webhook_manager,
     upload_handler=upload_handler,
+    skills_manager=skills_manager,
 ))
 
 # Admin Danger Zone wipes (Settings → System → Danger Zone)
@@ -760,7 +789,7 @@ from src.task_scheduler import TaskScheduler
 task_scheduler = TaskScheduler(session_manager)
 from src.event_bus import set_task_scheduler
 set_task_scheduler(task_scheduler)
-from routes.task_routes import setup_task_routes
+from routes.task.task_routes import setup_task_routes
 app.include_router(setup_task_routes(task_scheduler))
 
 from routes.assistant_routes import setup_assistant_routes
@@ -925,8 +954,12 @@ async def serve_login(request: Request):
 
 @app.get("/api/version")
 async def get_version():
-    from core.constants import APP_VERSION
-    return {"version": APP_VERSION}
+    from core.constants import APP_BUILD_VERSION, APP_SOURCE_COMMIT, APP_VERSION
+    return {
+        "version": APP_VERSION,
+        "build": APP_BUILD_VERSION,
+        "source_commit": APP_SOURCE_COMMIT,
+    }
 
 @app.get("/api/health")
 async def health_check() -> Dict[str, str]:
@@ -986,10 +1019,75 @@ async def runtime_info() -> Dict[str, object]:
         or os.getenv("OLLAMA_URL")
         or ("http://host.docker.internal:11434/v1" if in_docker else "http://127.0.0.1:11434/v1")
     )
+    network_mode = os.getenv("ODYSSEUS_CONTAINER_NETWORK_MODE", "").strip()
+    host_gateway_reachable = False
+    host_gateway_address = ""
+    if in_docker and network_mode != "host":
+        try:
+            resolved = socket.getaddrinfo("host.docker.internal", None)
+            for item in resolved:
+                sockaddr = item[4] if len(item) >= 5 else ()
+                candidate = sockaddr[0] if sockaddr else ""
+                if candidate:
+                    host_gateway_address = str(candidate)
+                    break
+            host_gateway_reachable = True
+        except OSError:
+            host_gateway_reachable = False
+        if not host_gateway_address:
+            host_gateway_address = _docker_default_gateway_ip()
+    container: Dict[str, object] = {
+        "engine": "docker" if in_docker else "",
+        "networkMode": network_mode,
+        "hostAccess": bool(in_docker and network_mode == "host"),
+        "hostGatewayReachable": host_gateway_reachable,
+    }
+    if host_gateway_address:
+        container["hostGatewayAddress"] = host_gateway_address
+    command_names = (
+        "ip",
+        "ss",
+        "arp",
+        "nmap",
+        "ping",
+        "dig",
+        "ssh",
+        "git",
+        "docker",
+    )
+    commands = {name: bool(shutil.which(name)) for name in command_names}
+    capabilities = {
+        "networkInspection": bool(commands["ip"] and (commands["ss"] or commands["arp"])),
+        "lanScan": bool(commands["nmap"]),
+        "dnsLookup": bool(commands["dig"]),
+        "sshClient": bool(commands["ssh"]),
+        "git": bool(commands["git"]),
+        "dockerClient": bool(commands["docker"]),
+    }
     return {
         "in_docker": in_docker,
         "ollama_base_url": ollama_url,
+        "container": container,
+        "commands": commands,
+        "capabilities": capabilities,
     }
+
+
+def _docker_default_gateway_ip() -> str:
+    try:
+        with open("/proc/net/route", "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh.readlines()[1:]:
+                parts = line.split()
+                if len(parts) < 3 or parts[1] != "00000000":
+                    continue
+                raw = parts[2]
+                if len(raw) != 8:
+                    continue
+                octets = [str(int(raw[i:i + 2], 16)) for i in range(6, -1, -2)]
+                return ".".join(octets)
+    except Exception:
+        return ""
+    return ""
 
 # ========= LIFECYCLE =========
 
@@ -1030,6 +1128,15 @@ async def _startup_event():
     # GC tasks created with `asyncio.create_task(...)` before they finish.
     _startup_tasks: list[asyncio.Task] = getattr(app.state, "_startup_tasks", [])
     app.state._startup_tasks = _startup_tasks
+    from src.background_tool_jobs import BackgroundToolJobs
+    from routes.chat_routes import _active_streams
+    from src import agent_runs
+    app.state.background_tool_jobs = BackgroundToolJobs(
+        is_busy=lambda sid: sid in _active_streams or agent_runs.is_active(sid),
+        session_manager=session_manager, research_handler=research_handler,
+    )
+    app.state.background_tool_delivery_task = asyncio.create_task(app.state.background_tool_jobs.run())
+    _startup_tasks.append(app.state.background_tool_delivery_task)
     if upload_cleanup_func:
         upload_cleanup_task = asyncio.create_task(upload_cleanup_func())
     # Always-on monitor that auto-continues the agent when a background bash
@@ -1056,23 +1163,34 @@ async def _startup_event():
 
     _startup_tasks.append(asyncio.create_task(_startup_mcp_connections()))
 
-    # Startup warmups are opt-in. They make later requests a little warmer, but
-    # they also compete with the first seconds of real UI use on slow or busy
-    # machines. Default to clear/idle startup and let requests warm what they use.
-    _startup_warmups_enabled = str(os.getenv("ODYSSEUS_STARTUP_WARMUPS", "")).lower() in {"1", "true", "yes", "on"}
-    if _startup_warmups_enabled:
+    # Semantic tool selection is part of the agent serving contract. Initialize
+    # it in a background thread by default so startup remains nonblocking while
+    # harness deployments can wait for the explicit readiness state.
+    from src.tool_index import prewarm_tool_index, tool_index_prewarm_enabled
+    if tool_index_prewarm_enabled():
         async def _warmup_tool_index():
-            try:
-                from src.tool_index import get_tool_index
-                idx = await asyncio.to_thread(get_tool_index)
-                if idx:
-                    await asyncio.to_thread(idx.get_tools_for_query, "warmup", 8)
-                    logger.info("[startup] Tool index pre-warmed")
-            except Exception as e:
-                logger.warning(f"Tool index warmup failed (non-critical): {type(e).__name__}: {e}")
+            status = await asyncio.to_thread(prewarm_tool_index)
+            if status.get("ready"):
+                logger.info(
+                    "[startup] Tool index pre-warmed lanes=%s tools=%s duration_ms=%s",
+                    [lane.get("name") for lane in status.get("lanes", [])],
+                    status.get("builtin_tools"),
+                    status.get("duration_ms"),
+                )
+            else:
+                logger.warning(
+                    "Tool index warmup degraded (non-critical): %s",
+                    status.get("error_type") or status.get("state"),
+                )
 
         _startup_tasks.append(asyncio.create_task(_warmup_tool_index()))
+    else:
+        logger.info("Tool index prewarm disabled (ODYSSEUS_TOOL_INDEX_PREWARM=0)")
 
+    # Model endpoint pings remain opt-in. They can compete with the first seconds
+    # of UI use on slow or busy machines and are not required for local startup.
+    _startup_warmups_enabled = str(os.getenv("ODYSSEUS_STARTUP_WARMUPS", "")).lower() in {"1", "true", "yes", "on"}
+    if _startup_warmups_enabled:
         async def _warmup_endpoints():
             try:
                 import httpx
@@ -1092,7 +1210,7 @@ async def _startup_event():
 
         _startup_tasks.append(asyncio.create_task(_warmup_endpoints()))
     else:
-        logger.info("Startup warmups disabled (set ODYSSEUS_STARTUP_WARMUPS=1 to enable)")
+        logger.info("Model endpoint warmups disabled (set ODYSSEUS_STARTUP_WARMUPS=1 to enable)")
 
     # Keep-alive is opt-in. The ping path performs model discovery, and when
     # stale LAN endpoints are configured it can add periodic backend pressure
@@ -1161,6 +1279,14 @@ async def _startup_event():
     # ownerless or deleted/test-owner SKILL.md files so strict owner filtering
     # does not make an existing library look empty after auth/account changes.
     try:
+        from services.memory.builtin_skills import install_builtin_skills
+        installed = install_builtin_skills(skills_manager, ())
+        if installed:
+            logger.info("Installed %s built-in skill file(s)", installed)
+    except Exception as e:
+        logger.debug(f"Built-in skill installation skipped: {e}")
+
+    try:
         import json as _json
         auth_path = AUTH_FILE
         with open(auth_path, encoding="utf-8") as f:
@@ -1205,35 +1331,10 @@ async def _startup_event():
 
     _startup_tasks.append(asyncio.create_task(_null_owner_sweep_loop()))
 
-    # Nightly skill audit — at ~02:00 local, test + judge a batch of the
-    # least-recently-checked skills, auto-fixing/escalating weak ones (never
-    # deletes). Rotates through the library so each night covers different
-    # skills. Gated by the `skill_audit_nightly` setting (default on); hour via
-    # `skill_audit_hour` (default 2), batch size via `skill_audit_batch` (8).
-    async def _skill_audit_nightly_loop():
-        from datetime import timedelta
-        while True:
-            try:
-                from src.settings import get_setting
-                hour = int(get_setting("skill_audit_hour", 2) or 2)
-            except Exception:
-                hour = 2
-            now = datetime.now()
-            nxt = now.replace(hour=hour % 24, minute=0, second=0, microsecond=0)
-            if nxt <= now:
-                nxt += timedelta(days=1)
-            await asyncio.sleep(max(60, (nxt - now).total_seconds()))
-            try:
-                from src.settings import get_setting
-                if not get_setting("skill_audit_nightly", True):
-                    continue
-                batch = int(get_setting("skill_audit_batch", 8) or 8)
-                from routes.skills_routes import run_scheduled_skill_audit
-                await run_scheduled_skill_audit(skills_manager, owner=None, max_skills=batch)
-            except Exception as e:
-                logger.warning(f"Nightly skill audit failed: {e}")
-
-    _startup_tasks.append(asyncio.create_task(_skill_audit_nightly_loop()))
+    # Skills Audit is scheduled per owner by TaskScheduler. Do not also start
+    # an ownerless audit here: its sidecar results cannot be read back through
+    # an authenticated owner's skill namespace, and its model activity can
+    # defer the real per-owner task at the same time of night.
 
     # Cookbook serve lifecycle — kills scheduler-launched serves whose
     # window-end has passed. Paired with the cookbook_serve builtin
@@ -1244,10 +1345,30 @@ async def _startup_event():
     from src.cookbook_serve_lifecycle import cookbook_serve_lifecycle_loop
     _startup_tasks.append(asyncio.create_task(cookbook_serve_lifecycle_loop()))
 
+    # Reconcile the processes a previous run left behind: tear down orphaned
+    # containment grants, and stop trusting background-job records whose pid the
+    # kernel has since reassigned. Runs once, and deliberately runs *here* —
+    # every record it sees predates this run, which is what makes "I cannot
+    # identify this process" a safe thing to act on. See src/process_reaper.py.
+    from src.process_reaper import reap_orphans_at_startup
+    _startup_tasks.append(asyncio.create_task(reap_orphans_at_startup()))
+
     logger.info("Application startup complete")
 
 async def _shutdown_event():
     logger.info("Application shutting down...")
+    background_delivery = getattr(app.state, 'background_tool_delivery_task', None)
+    if background_delivery:
+        background_delivery.cancel()
+        try:
+            await background_delivery
+        except asyncio.CancelledError:
+            pass
+    try:
+        from src.agent_tools.web_tools import shutdown_private_browser_sessions
+        await shutdown_private_browser_sessions()
+    except Exception as e:
+        logger.warning(f"Private browser shutdown error: {e}")
     if upload_cleanup_task:
         upload_cleanup_task.cancel()
         try:
@@ -1276,6 +1397,6 @@ if __name__ == "__main__":
     import uvicorn
 
     bind_host = os.getenv("APP_BIND", "127.0.0.1")
-    bind_port = int(os.getenv("APP_PORT", "7000"))
+    bind_port = int(os.getenv("APP_PORT", "7011"))
 
     uvicorn.run(app, host=bind_host, port=bind_port, log_level="info")

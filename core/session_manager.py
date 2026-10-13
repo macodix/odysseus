@@ -14,6 +14,8 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional
 
+from sqlalchemy import func
+
 from .database import Session as DbSession, ChatMessage as DbChatMessage, Document as DbDocument, SessionLocal, utcnow_naive
 from .models import Session, ChatMessage
 from src.attachment_refs import persistable_message_content
@@ -92,14 +94,28 @@ class SessionManager:
         try:
             db_sessions = db.query(DbSession).filter(
                 DbSession.archived == False,
-                DbSession.message_count > 0,
+                DbSession.messages.any(),
             ).order_by(DbSession.last_accessed.desc()).limit(100).all()
+
+            # message_count is derived metadata and can drift after interrupted
+            # or legacy writes. Count only the bounded discovery set so startup
+            # remains metadata-only while lazy hydration sees an authoritative
+            # positive count for every discovered non-empty session.
+            message_counts = {}
+            if db_sessions:
+                message_counts = dict(
+                    db.query(DbChatMessage.session_id, func.count(DbChatMessage.id))
+                    .filter(DbChatMessage.session_id.in_([row.id for row in db_sessions]))
+                    .group_by(DbChatMessage.session_id)
+                    .all()
+                )
 
             loaded_count = 0
             for db_session in db_sessions:
                 try:
                     session = self._db_to_session_meta(db_session)
                     if session is not None:
+                        session.message_count = message_counts[db_session.id]
                         self.sessions[db_session.id] = session
                         loaded_count += 1
                 except Exception as e:
@@ -134,6 +150,14 @@ class SessionManager:
             history=[],
             owner=getattr(db_session, "owner", None),
             is_important=getattr(db_session, "is_important", False) or False,
+            memory_extraction_enabled=getattr(db_session, "memory_extraction_enabled", True) is not False,
+            memory_injection_enabled=getattr(db_session, "memory_injection_enabled", True) is not False,
+            skill_injection_enabled=getattr(db_session, "skill_injection_enabled", True) is not False,
+            thinking_mode=getattr(db_session, "thinking_mode", "") or "off",
+            temperature_override=getattr(db_session, "temperature_override", None),
+            max_tokens_override=getattr(db_session, "max_tokens_override", None),
+            cwd=getattr(db_session, "cwd", None) or None,
+            endpoint_id=getattr(db_session, "endpoint_id", None) or None,
         )
         session.message_count = getattr(db_session, "message_count", 0) or 0
         return session
@@ -192,6 +216,14 @@ class SessionManager:
             history=history,
             owner=getattr(db_session, 'owner', None),
             is_important=getattr(db_session, 'is_important', False) or False,
+            memory_extraction_enabled=getattr(db_session, 'memory_extraction_enabled', True) is not False,
+            memory_injection_enabled=getattr(db_session, 'memory_injection_enabled', True) is not False,
+            skill_injection_enabled=getattr(db_session, 'skill_injection_enabled', True) is not False,
+            thinking_mode=getattr(db_session, "thinking_mode", "") or "off",
+            temperature_override=getattr(db_session, "temperature_override", None),
+            max_tokens_override=getattr(db_session, "max_tokens_override", None),
+            cwd=getattr(db_session, "cwd", None) or None,
+            endpoint_id=getattr(db_session, "endpoint_id", None) or None,
         )
 
         # The rows just loaded are the whole transcript, so they — not the
@@ -463,12 +495,14 @@ class SessionManager:
                     headers = {}
             session.name = db_session.name
             session.endpoint_url = db_session.endpoint_url or ""
+            session.endpoint_id = getattr(db_session, "endpoint_id", None) or None
             session.model = db_session.model or ""
             session.headers = headers or {}
             session.rag = db_session.rag
             session.archived = db_session.archived
             session.owner = getattr(db_session, "owner", None)
             session.is_important = getattr(db_session, "is_important", False) or False
+            session.cwd = getattr(db_session, "cwd", None) or None
             session.message_count = (
                 db.query(DbChatMessage)
                 .filter(DbChatMessage.session_id == session_id)
@@ -529,9 +563,15 @@ class SessionManager:
         endpoint_url: str,
         model: str,
         rag: bool = False,
-        owner: str = None
+        owner: str = None,
+        cwd: str = None,
+        headers: Optional[Dict[str, str]] = None,
+        endpoint_id: Optional[str] = None,
     ) -> Session:
         """Create a new session and save to database."""
+        from src.chatgpt_subscription import is_chatgpt_subscription_base
+        session_headers = {} if is_chatgpt_subscription_base(endpoint_url) else dict(headers or {})
+        endpoint_id = (endpoint_id or "").strip() or None
         db = SessionLocal()
         try:
             db_session = DbSession(
@@ -540,8 +580,10 @@ class SessionManager:
                 endpoint_url=endpoint_url,
                 model=model,
                 rag=rag,
-                headers={},
+                headers=session_headers,
                 owner=owner,
+                cwd=cwd or None,
+                endpoint_id=endpoint_id,
                 created_at=datetime.now(timezone.utc),
                 updated_at=datetime.now(timezone.utc)
             )
@@ -554,8 +596,10 @@ class SessionManager:
                 endpoint_url=endpoint_url,
                 model=model,
                 rag=rag,
-                headers={},
+                headers=session_headers,
                 owner=owner,
+                cwd=cwd or None,
+                endpoint_id=endpoint_id,
             )
 
             self.sessions[session_id] = session
@@ -568,13 +612,16 @@ class SessionManager:
         finally:
             db.close()
 
-    def delete_session(self, session_id: str) -> bool:
+    def delete_session(self, session_id: str, *, delete_images: bool = False) -> bool:
         """Permanently delete a session and all its messages."""
         db = SessionLocal()
         try:
             try:
-                from src.session_image_cleanup import cleanup_session_images
-                cleanup_session_images(session_id, db=db)
+                from src.session_image_cleanup import cleanup_session_images, preserve_session_images
+                if delete_images:
+                    cleanup_session_images(session_id, db=db)
+                else:
+                    preserve_session_images(session_id, db=db)
             except Exception as e:
                 logger.warning(f"Image cleanup failed while deleting session {session_id}: {e}")
 

@@ -12,34 +12,64 @@ import pytest
 
 _REPO = Path(__file__).resolve().parent.parent
 _SETTINGS_JS = _REPO / "static" / "js" / "settings.js"
+_SETTINGS_DIR = _REPO / "static" / "js" / "settings"
+_SETTINGS_API_JS = _SETTINGS_DIR / "api.js"
 _HAS_NODE = shutil.which("node") is not None
 
 
 @pytest.mark.skipif(not _HAS_NODE, reason="node binary not on PATH")
 def test_settings_js_syntax():
-    """Verify static/js/settings.js is syntactically valid JavaScript."""
-    proc = subprocess.run(
-        ["node", "--check", str(_SETTINGS_JS)],
-        capture_output=True,
-        text=True,
-        cwd=str(_REPO),
-    )
-    assert proc.returncode == 0, f"JS syntax error:\n{proc.stderr}"
-
-
-def test_all_settings_post_calls_verify_response_ok():
-    """Every POST to /api/auth/settings in settings.js must check response.ok."""
-    content = _SETTINGS_JS.read_text(encoding="utf-8")
-    matches = list(re.finditer(r"fetch\(['\"]/api/auth/settings['\"],\s*\{\s*method:\s*['\"]POST['\"]", content))
-    assert len(matches) >= 10, f"Expected at least 10 POST /api/auth/settings calls, found {len(matches)}"
-
-    for m in matches:
-        # Check that within the 500 characters following the fetch invocation, .ok is inspected
-        window = content[m.start(): m.start() + 500]
-        assert ".ok" in window, (
-            f"Found POST fetch to /api/auth/settings without .ok check near char {m.start()}:\n"
-            f"{window[:150]}..."
+    """Verify static/js/settings.js and settings/*.js modules are syntactically valid JavaScript."""
+    js_files = [_SETTINGS_JS] + list(_SETTINGS_DIR.glob("*.js"))
+    for js_file in js_files:
+        proc = subprocess.run(
+            ["node", "--check", str(js_file)],
+            capture_output=True,
+            text=True,
+            cwd=str(_REPO),
         )
+        assert proc.returncode == 0, f"JS syntax error in {js_file.name}:\n{proc.stderr}"
+
+
+def test_post_settings_helper_verifies_response_ok():
+    """Centralized postSettings in settings/api.js must verify response.ok and throw on failure."""
+    assert _SETTINGS_API_JS.exists(), f"Expected {_SETTINGS_API_JS} to exist"
+    api_content = _SETTINGS_API_JS.read_text(encoding="utf-8")
+
+    # Verify fetch to /api/auth/settings with POST method
+    match = re.search(r"fetch\(['\"]/api/auth/settings['\"],\s*\{\s*method:\s*['\"]POST['\"]", api_content)
+    assert match is not None, "Expected POST fetch to /api/auth/settings in settings/api.js"
+
+    # Verify .ok is checked within 300 characters of fetch
+    window = api_content[match.start(): match.start() + 300]
+    assert ".ok" in window, f"postSettings must check response.ok:\n{window}"
+
+    # Verify that it throws an error when !response.ok
+    assert "throw error" in api_content or "throw new Error" in api_content, (
+        "postSettings must throw when response is not ok"
+    )
+
+
+def test_all_settings_save_handlers_route_through_post_settings():
+    """All settings save handlers in settings.js and settings/*.js must route saves via postSettings."""
+    settings_content = _SETTINGS_JS.read_text(encoding="utf-8")
+    module_contents = {p.name: p.read_text(encoding="utf-8") for p in _SETTINGS_DIR.glob("*.js")}
+
+    # Assert no unverified direct POST fetch to /api/auth/settings in settings.js
+    direct_posts = list(re.finditer(r"fetch\(['\"]/api/auth/settings['\"],\s*\{\s*method:\s*['\"]POST['\"]", settings_content))
+    assert len(direct_posts) == 0, (
+        f"Found direct POST fetch to /api/auth/settings in settings.js; all writes must route through _postSettings"
+    )
+
+    # Count _postSettings invocations across settings.js and modules
+    post_settings_calls = len(re.findall(r"_postSettings\(", settings_content))
+    for mod_name, mod_text in module_contents.items():
+        if mod_name != "api.js":
+            post_settings_calls += len(re.findall(r"_postSettings\(", mod_text))
+
+    assert post_settings_calls >= 15, (
+        f"Expected at least 15 _postSettings calls across settings modules, found {post_settings_calls}"
+    )
 
 
 @pytest.mark.skipif(not _HAS_NODE, reason="node binary not on PATH")

@@ -510,7 +510,12 @@ async def do_manage_settings(content: str, owner: Optional[str] = None) -> Dict:
         # set/get/list/delete operate on the REAL app settings (the same store
         # the Settings panel writes), so changing a model / voice / search
         # engine / reminder channel from chat actually takes effect.
-        from src.settings import load_settings, save_settings, DEFAULT_SETTINGS
+        from src.settings import (
+            DEFAULT_SETTINGS,
+            RETIRED_SETTING_KEYS,
+            load_settings,
+            save_settings,
+        )
 
         # Secrets/credentials the agent must NOT write: kept read-only (masked)
         # so API keys never flow through chat. User sets these in the panel.
@@ -555,12 +560,18 @@ async def do_manage_settings(content: str, owner: Optional[str] = None) -> Dict:
             "hard max": "agent_input_token_hard_max",
             "token budget cap": "agent_input_token_hard_max",
             "input budget cap": "agent_input_token_hard_max",
+            "writing style": "document_writing_style", "document writing style": "document_writing_style",
+            "email writing style": "email_writing_style",
+            "reply writing style": "email_writing_style", "email reply writing style": "email_writing_style",
         }
         def _resolve(k):
             k2 = (k or "").strip().lower()
             if k2 in DEFAULT_SETTINGS:
                 return k2
             return _ALIASES_SET.get(k2, (k or "").strip())
+
+        def _is_managed_key(key):
+            return key in DEFAULT_SETTINGS and key not in RETIRED_SETTING_KEYS
 
         _ENUMS = {
             "image_quality": ["low", "medium", "high"],
@@ -624,14 +635,18 @@ async def do_manage_settings(content: str, owner: Optional[str] = None) -> Dict:
 
         if action == "list":
             s = load_settings()
-            shown = {k: _mask(k, v) for k, v in s.items() if k in DEFAULT_SETTINGS and not isinstance(v, dict)}
+            shown = {
+                k: _mask(k, v)
+                for k, v in s.items()
+                if _is_managed_key(k) and not isinstance(v, dict)
+            }
             return {"response": f"{len(shown)} settings (use get/set with a key)", "settings": shown, "exit_code": 0}
 
         elif action == "get":
             key = _resolve(args.get("key", ""))
             if not key:
                 return {"error": "key is required", "exit_code": 1}
-            if key not in DEFAULT_SETTINGS:
+            if not _is_managed_key(key):
                 return {"error": f"Unknown setting '{args.get('key')}'. Use action='list' to see them.", "exit_code": 1}
             val = load_settings().get(key, DEFAULT_SETTINGS.get(key))
             return {"response": f"{key} = {_mask(key, val)}", "value": _mask(key, val), "exit_code": 0}
@@ -642,11 +657,11 @@ async def do_manage_settings(content: str, owner: Optional[str] = None) -> Dict:
             if not raw:
                 return {"error": "key is required", "exit_code": 1}
             key = _resolve(raw)
-            if key not in DEFAULT_SETTINGS:
+            if not _is_managed_key(key):
                 return {"error": f"Unknown setting '{raw}'. Use action='list' to see available settings.", "exit_code": 1}
             if _is_secret(key):
                 return {"response": f"'{key}' is a credential/secret. For security I can't set it from chat. Open Settings and set it there.", "exit_code": 0}
-            # Structured settings (dicts/lists like keybinds, default_model_fallbacks)
+            # Structured settings (dicts/lists like keybinds or vision fallbacks)
             # have no safe scalar coercion; _coerce would pass a bare string
             # straight through and clobber the structure. Refuse them here; they're
             # edited in their dedicated panels. (reset/delete still restore the
@@ -675,7 +690,7 @@ async def do_manage_settings(content: str, owner: Optional[str] = None) -> Dict:
 
         elif action == "delete" or action == "reset":
             key = _resolve(args.get("key", ""))
-            if key not in DEFAULT_SETTINGS:
+            if not _is_managed_key(key):
                 return {"error": f"Unknown setting '{args.get('key')}'.", "exit_code": 1}
             if _is_secret(key):
                 return {"response": f"'{key}' is a credential. Reset it in the panel.", "exit_code": 0}
@@ -688,7 +703,7 @@ async def do_manage_settings(content: str, owner: Optional[str] = None) -> Dict:
             # Tool-toggle actions. These edit settings.json:disabled_tools
             # (the global list read on every chat request) rather than
             # prefs.json. Friendly aliases accepted: "shell" -> "bash",
-            # "search" -> "web_search", "browser" -> "builtin_browser",
+            # "search" -> "web_search", "browser" -> browser tools,
             # "documents" -> the document tool set, "memory" ->
             # manage_memory, etc.
             from src.settings import get_setting, save_settings, load_settings
@@ -697,7 +712,7 @@ async def do_manage_settings(content: str, owner: Optional[str] = None) -> Dict:
                 "terminal": ["bash"],
                 "search": ["web_search", "web_fetch"],
                 "web": ["web_search", "web_fetch"],
-                "browser": ["builtin_browser"],
+                "browser": ["builtin_browser", "private_browser"],
                 "documents": ["create_document", "edit_document", "update_document", "suggest_document"],
                 "doc": ["create_document", "edit_document", "update_document", "suggest_document"],
                 "memory": ["manage_memory"],

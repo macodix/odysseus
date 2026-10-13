@@ -14,6 +14,13 @@ from src.constants import SETTINGS_FILE, FEATURES_FILE
 
 logger = logging.getLogger(__name__)
 
+# Keys retained in the raw settings store for compatibility and rollback, but
+# deliberately unavailable through generic settings APIs or agent tools.  They
+# must stay in ``DEFAULT_SETTINGS`` so old files continue to load without data
+# loss; callers that present or mutate settings should use this set as a
+# tombstone boundary.
+RETIRED_SETTING_KEYS = frozenset({"default_model_fallbacks"})
+
 # Tiny TTL cache for settings/features. get_setting() is called on hot paths
 # (every chat, every preprocess); without this it re-parses the JSON each call.
 # Picks up edits within _CACHE_TTL seconds, which is fine for human-edited config.
@@ -125,6 +132,7 @@ DEFAULT_SETTINGS = {
     # `compute_input_token_budget`.
     "agent_input_token_hard_max": 200_000,
     "agent_stream_timeout_seconds": 300,
+    "auto_compact_threshold_percent": 85,
     # Extra directory roots that read_file / write_file may access, in
     # addition to the built-in project data/ and system temp dirs. Each
     # entry is an absolute path. Sensitive subpaths (.ssh, .gnupg, shell
@@ -138,6 +146,7 @@ DEFAULT_SETTINGS = {
     # Email replies use email_writing_style instead because greetings,
     # signatures, and mailbox identity rules are medium-specific.
     "document_writing_style": "",
+    "email_writing_style": "",
     # Legacy ordered fallback chain for the default chat model. Values remain
     # stored for compatibility and rollback reference, but model routing no
     # longer reads this key.
@@ -151,6 +160,10 @@ DEFAULT_SETTINGS = {
     # Ordered fallback chain for the Utility model (summarization, naming,
     # tidy actions, etc.).
     "utility_model_fallbacks": [],
+    # Opt-in reasoning effort for utility/background LLM calls. Empty keeps the
+    # provider default; a value is sent only to utility-chain candidates whose
+    # model advertises that level.
+    "utility_reasoning_effort": "",
     "teacher_model": "",
     "teacher_enabled": False,
     "teacher_tier2_enabled": False,
@@ -188,7 +201,6 @@ DEFAULT_SETTINGS = {
     # Keyboard shortcuts (action: key combination)
     "keybinds": {
         "search": "ctrl+k",
-        "toggle_sidebar": "ctrl+b",
         "new_session": "ctrl+alt+n",
         "star_session": "ctrl+alt+s",
         "delete_session": "ctrl+alt+d",
@@ -196,6 +208,17 @@ DEFAULT_SETTINGS = {
         "cancel": "escape",
     },
 }
+
+
+def without_retired_settings(settings: dict) -> dict:
+    """Return a shallow copy suitable for generic settings interfaces."""
+    if not isinstance(settings, dict):
+        return {}
+    return {
+        key: value
+        for key, value in settings.items()
+        if key not in RETIRED_SETTING_KEYS
+    }
 
 DEFAULT_FEATURES = {
     "web_search": True,
@@ -269,8 +292,9 @@ _PER_USER_KEYS = {
     # Default chat endpoint / model — without per-user resolution every new
     # account inherited whatever the most-recent admin picked, which then
     # got injected into the chat composer on first open.
-    "default_endpoint_id", "default_model", "default_model_fallbacks",
+    "default_endpoint_id", "default_model",
     "utility_endpoint_id", "utility_model", "utility_model_fallbacks",
+    "utility_reasoning_effort",
     "research_endpoint_id", "research_model",
 }
 
